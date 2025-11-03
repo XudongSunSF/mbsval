@@ -130,7 +130,7 @@ sequenceDiagram
     U->>P: Submit Request
     P->>A: Validate & Forward Request
     A->>M: Route to Model Suite Layer
-    M->>D: Request Data (Portfolio, Params, Market Data)
+    M->>D: Request Data (Portfolio, Params, Economic Data)
     D->>C: Check Cache (L1/L2/L3)
     C-->>D: Cached Data or Miss
     D-->>M: Data (from cache or source)

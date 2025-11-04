@@ -130,7 +130,7 @@ sequenceDiagram
     U->>P: Submit Request
     P->>A: Validate & Forward Request
     A->>M: Route to Model Suite Layer
-    M->>D: Request Data (Portfolio, Params, Economic Data)
+    M->>D: Request Data (Portfolio, Params, Market Data)
     D->>C: Check Cache (L1/L2/L3)
     C-->>D: Cached Data or Miss
     D-->>M: Data (from cache or source)
@@ -216,7 +216,11 @@ The central coordinator for all suite execution, responsible for:
 - Handles result aggregation and consolidation
 
 **Execution Coordination:**
-- Executes suites in topologically sorted order
+- For each suite in the execution plan (in topological order):
+  - Constructs ExecutionContext with portfolio, parameters, and dependency outputs
+  - Invokes the suite's `execute()` method via the SuiteExecutor interface
+  - Captures SuiteResult and stores in Intermediate Result Store
+  - Maps suite outputs to dependent suite inputs per Registry specifications
 - Manages parallel execution where dependencies allow
 - Handles error propagation and rollback strategies
 - Provides execution monitoring and progress tracking
@@ -258,9 +262,10 @@ Formal specifications of suite interfaces:
 - Dependency satisfaction validation
 
 #### 4.1.3 Individual Model Suites
-Each suite encapsulates complete business logic for its domain:
+Each suite encapsulates complete business logic for its domain and implements the SuiteExecutor interface:
 
 **Behavioral Model Suite:**
+- Implements SuiteExecutor::execute() to orchestrate behavioral model calculations
 - Contains prepayment models, default models, loss severity models
 - Orchestrates execution across behavioral models
 - Manages behavioral model dependencies and data flows
@@ -268,6 +273,7 @@ Each suite encapsulates complete business logic for its domain:
 - Implements behavioral model-specific business rules
 
 **Pricing Model Suite:**
+- Implements SuiteExecutor::execute() to orchestrate pricing calculations
 - Contains OAS pricing models, yield calculation models, spread models
 - Depends on Behavioral Suite for prepayment and default inputs
 - Orchestrates pricing calculations with market data integration
@@ -275,6 +281,7 @@ Each suite encapsulates complete business logic for its domain:
 - Implements pricing model-specific business rules
 
 **Cash Flow Suite:**
+- Implements SuiteExecutor::execute() to orchestrate cash flow projections
 - Contains cash flow projection models and timing models
 - Depends on Behavioral Suite for prepayment and default scenarios
 - Projects principal, interest, and loss cash flows
@@ -284,7 +291,7 @@ Each suite encapsulates complete business logic for its domain:
 **...**
 
 **Suite-Level Orchestration:**
-Within each suite, the suite orchestrator manages:
+Within each suite's execute() method, the suite manages:
 - Model execution sequencing within the suite
 - Model-specific portfolio processing
 - Aggregation of model results
@@ -325,6 +332,197 @@ Common calculations and transformations:
 - Statistical calculations and aggregations
 - Financial mathematics functions
 - Unit conversions and standardizations
+
+#### 4.1.5 Suite Executor Interface
+The standard contract that all model suites must implement to enable Workflow Orchestrator invocation:
+
+**SuiteExecutor Abstract Base Class:**
+Every model suite inherits from and implements the SuiteExecutor interface:
+
+```cpp
+class SuiteExecutor {
+public:
+    virtual ~SuiteExecutor() = default;
+    
+    /**
+     * Execute the model suite with the given execution context
+     * 
+     * @param context Contains portfolio, parameters, and dependency outputs
+     * @return SuiteResult containing all suite outputs and metadata
+     * @throws SuiteExecutionException if execution fails
+     */
+    virtual SuiteResult execute(const ExecutionContext& context) = 0;
+    
+    /**
+     * Get suite metadata for registration and dependency resolution
+     */
+    virtual SuiteMetadata getMetadata() const = 0;
+    
+    /**
+     * Validate that the suite can execute with the given context
+     * Called before execute() to fail fast on missing dependencies
+     */
+    virtual void validate(const ExecutionContext& context) const = 0;
+};
+```
+
+**ExecutionContext Structure:**
+The context object passed to each suite's execute() method contains all necessary inputs:
+
+```cpp
+struct ExecutionContext {
+    // Enriched portfolio (after Common Portfolio Enricher)
+    Portfolio portfolio;
+    
+    // Suite-specific parameters and configuration
+    std::unordered_map<std::string, Parameter> parameters;
+    
+    // Outputs from upstream dependency suites
+    // Key: suite_name, Value: suite outputs (e.g., prepay_rates, default_rates)
+    std::unordered_map<std::string, SuiteOutputs> dependencyOutputs;
+    
+    // Request-level metadata
+    RequestMetadata requestMetadata;
+    
+    // Cache accessor for suite-level caching
+    std::shared_ptr<CacheAccessor> cacheAccessor;
+    
+    // Intermediate result store accessor for storing/retrieving cross-suite data
+    std::shared_ptr<IntermediateResultStore> resultStore;
+    
+    // Effective date for market data and calculations
+    Date effectiveDate;
+};
+```
+
+**SuiteResult Structure:**
+The result object returned by each suite's execute() method:
+
+```cpp
+struct SuiteResult {
+    // Suite identification
+    std::string suiteName;
+    std::string suiteVersion;
+    
+    // Primary outputs (values exposed to other suites or final results)
+    std::unordered_map<std::string, OutputField> outputs;
+    
+    // Intermediate values (stored for dependent suites)
+    std::unordered_map<std::string, IntermediateValue> intermediates;
+    
+    // Execution metadata
+    ExecutionMetadata metadata;  // Timing, memory, warnings, etc.
+    
+    // Validation status
+    ValidationResult validation;
+    
+    // Model-level results (if needed for detailed output)
+    std::vector<ModelResult> modelResults;
+};
+```
+
+**Suite Implementation Pattern:**
+Each concrete model suite implements the SuiteExecutor interface:
+
+```cpp
+class BehavioralSuite : public SuiteExecutor {
+public:
+    SuiteResult execute(const ExecutionContext& context) override {
+        // 1. Perform suite-specific portfolio enrichment
+        Portfolio enrichedPortfolio = enrichForBehavioral(context.portfolio);
+        
+        // 2. Execute constituent models in sequence
+        auto prepayResults = prepaymentModel_->calculate(enrichedPortfolio, context.parameters);
+        auto defaultResults = defaultModel_->calculate(enrichedPortfolio, context.parameters);
+        
+        // 3. Store intermediate results for dependent suites
+        context.resultStore->store("prepay_rates", prepayResults);
+        context.resultStore->store("default_rates", defaultResults);
+        
+        // 4. Aggregate and package results
+        SuiteResult result;
+        result.suiteName = "BehavioralSuite";
+        result.suiteVersion = "1.0.0";
+        result.outputs = aggregateOutputs(prepayResults, defaultResults);
+        result.intermediates = packageIntermediates(prepayResults, defaultResults);
+        
+        return result;
+    }
+    
+    // ... other interface implementations
+};
+
+class PricingSuite : public SuiteExecutor {
+public:
+    SuiteResult execute(const ExecutionContext& context) override {
+        // 1. Retrieve dependency outputs from context
+        const auto& behavioralOutputs = context.dependencyOutputs.at("BehavioralSuite");
+        auto prepayRates = behavioralOutputs.get("prepay_rates");
+        auto defaultRates = behavioralOutputs.get("default_rates");
+        
+        // 2. Perform suite-specific enrichment
+        Portfolio enrichedPortfolio = enrichForPricing(context.portfolio);
+        
+        // 3. Execute pricing models using behavioral inputs
+        auto oasResults = oasModel_->calculate(
+            enrichedPortfolio, 
+            prepayRates, 
+            defaultRates,
+            context.parameters
+        );
+        
+        // 4. Package results
+        SuiteResult result;
+        result.suiteName = "PricingSuite";
+        result.suiteVersion = "2.1.0";
+        result.outputs = packagePricingOutputs(oasResults);
+        
+        return result;
+    }
+    
+    // ... other interface implementations
+};
+```
+
+**Workflow Orchestrator Invocation Pattern:**
+The orchestrator invokes suites through this standardized interface:
+
+```cpp
+// In WorkflowOrchestrator::executeWorkflow()
+for (const auto& suiteInfo : executionPlan) {
+    // 1. Get suite executor instance from registry
+    auto suite = registry_->getSuiteExecutor(suiteInfo.suiteName, suiteInfo.version);
+    
+    // 2. Construct execution context
+    ExecutionContext context;
+    context.portfolio = enrichedPortfolio;
+    context.parameters = suiteInfo.parameters;
+    context.dependencyOutputs = gatherDependencyOutputs(suiteInfo.dependencies);
+    context.requestMetadata = requestMetadata_;
+    context.cacheAccessor = cacheAccessor_;
+    context.resultStore = intermediateResultStore_;
+    context.effectiveDate = effectiveDate_;
+    
+    // 3. Validate before execution
+    suite->validate(context);
+    
+    // 4. Execute suite
+    SuiteResult result = suite->execute(context);
+    
+    // 5. Store result for dependent suites
+    intermediateResultStore_->storeSuiteResult(suiteInfo.suiteName, result);
+    
+    // 6. Update outputs map for next suite in chain
+    dependencyOutputsMap[suiteInfo.suiteName] = result.outputs;
+}
+```
+
+**Benefits of This Design:**
+- **Uniform Interface:** All suites accessed through same execute() method
+- **Decoupling:** Orchestrator doesn't need to know suite internals
+- **Testability:** Each suite can be tested independently with mock context
+- **Extensibility:** New suites added by implementing interface and registering
+- **Composition:** Suites can be combined in any order based on dependencies
 
 ### 4.2 Model-Specific vs. Suite-Specific vs. Common Logic
 

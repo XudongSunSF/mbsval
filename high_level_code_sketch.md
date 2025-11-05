@@ -490,3 +490,359 @@ UniversalResult (aggregated, all results immutable)
     ↓
 [Presentation Layer] - Display to User
 
+
+Adding GPU Executor Support
+
+```
+✓ Presentation Layer          - No changes
+✓ Application Layer           - No changes
+✓ WorkflowOrchestrator       - No changes (doesn't care about execution strategy)
+✓ SuiteRegistry              - No changes
+✓ SuiteExecutor Interface    - No changes (same execute() contract)
+✓ Data Access Layer          - No changes
+✓ Cache Layer                - No changes
+✓ UniversalResult structure  - No changes
+✓ ExecutionContext           - No changes
+```
+
+GPU execution is an internal implementation detail of individual model suites. The orchestrator doesn't need to know how a suite executes, only what it produces.
+
+What Changes (Localized to Model Suites)
+1. Suite Implementation - Internal Execution Strategy
+
+```cpp
+//==============================================================================
+// Model Suite with GPU Support
+//==============================================================================
+
+class BehavioralSuite : public SuiteExecutor {
+public:
+    BehavioralSuite(ExecutionDevice device = ExecutionDevice::CPU);
+    
+    SuiteResult execute(const ExecutionContext& context) override {
+        // Same interface, different implementation
+        
+        if (device_ == ExecutionDevice::GPU) {
+            return executeOnGPU(context);
+        } else {
+            return executeOnCPU(context);
+        }
+    }
+    
+private:
+    ExecutionDevice device_;
+    
+    SuiteResult executeOnCPU(const ExecutionContext& context);
+    SuiteResult executeOnGPU(const ExecutionContext& context);
+    
+    // GPU-specific resources
+    std::unique_ptr<GPUContext> gpuContext_;
+    std::shared_ptr<PrepaymentModelGPU> prepaymentModelGPU_;
+    std::shared_ptr<DefaultModelGPU> defaultModelGPU_;
+    
+    // CPU resources (keep for fallback)
+    std::shared_ptr<PrepaymentModel> prepaymentModelCPU_;
+    std::shared_ptr<DefaultModel> defaultModelCPU_;
+};
+
+enum class ExecutionDevice {
+    CPU,
+    GPU,
+    AUTO  // Automatically select based on data size/availability
+};
+```
+
+Key Point: The execute() interface remains identical. GPU is an internal implementation choice.
+
+2. Configuration - Specify Execution Device
+```cpp
+//==============================================================================
+// Suite Metadata Extension (Optional)
+//==============================================================================
+
+struct SuiteMetadata {
+    std::string name;
+    std::string version;
+    std::vector<std::string> dependencies;
+    InputOutputContract contract;
+    
+    // Optional: GPU capability metadata
+    ExecutionCapabilities capabilities;
+};
+
+struct ExecutionCapabilities {
+    bool supportsGPU;
+    bool supportsCPU;
+    size_t minGPUMemoryMB;  // Minimum GPU memory required
+    std::vector<std::string> gpuArchitectures;  // "CUDA", "ROCm", "Metal"
+};
+
+//==============================================================================
+// Suite Metadata Extension (Optional)
+//==============================================================================
+
+struct SuiteMetadata {
+    std::string name;
+    std::string version;
+    std::vector<std::string> dependencies;
+    InputOutputContract contract;
+    
+    // Optional: GPU capability metadata
+    ExecutionCapabilities capabilities;
+};
+
+struct ExecutionCapabilities {
+    bool supportsGPU;
+    bool supportsCPU;
+    size_t minGPUMemoryMB;  // Minimum GPU memory required
+    std::vector<std::string> gpuArchitectures;  // "CUDA", "ROCm", "Metal"
+};
+
+//==============================================================================
+// Request-Level Configuration
+//==============================================================================
+
+struct ValuationRequest {
+    std::string portfolioSource;
+    std::vector<std::string> suites;
+    std::map<std::string, Parameter> parameters;
+    Date effectiveDate;
+    SessionConfig sessionConfig;
+    
+    // NEW: Execution preferences (optional)
+    ExecutionConfig executionConfig;
+};
+
+struct ExecutionConfig {
+    ExecutionDevice preferredDevice = ExecutionDevice::AUTO;
+    
+    // Per-suite overrides
+    std::map<std::string, ExecutionDevice> suiteDeviceOverrides;
+    // Example: {"behavioral": GPU, "pricing": CPU}
+    
+    // GPU resource limits
+    size_t maxGPUMemoryMB = 8192;
+    int gpuDeviceId = 0;  // Which GPU to use
+};
+```
+
+3. Suite Registry - Device-Aware Instantiation
+```cpp
+//==============================================================================
+// Suite Registry Creates Executors with Requested Device
+//==============================================================================
+
+class SuiteRegistry {
+public:
+    std::shared_ptr<SuiteExecutor> getSuiteExecutor(
+        const std::string& name,
+        const std::string& version,
+        ExecutionDevice device = ExecutionDevice::CPU  // NEW parameter
+    ) {
+        auto key = makeSuiteKey(name, version, device);
+        
+        // Check if already instantiated
+        auto it = executors_.find(key);
+        if (it != executors_.end()) {
+            return it->second;
+        }
+        
+        // Create new executor with requested device
+        auto executor = createExecutor(name, version, device);
+        executors_[key] = executor;
+        return executor;
+    }
+    
+private:
+    std::shared_ptr<SuiteExecutor> createExecutor(
+        const std::string& name,
+        const std::string& version,
+        ExecutionDevice device
+    ) {
+        if (name == "behavioral") {
+            return std::make_shared<BehavioralSuite>(device);
+        }
+        else if (name == "pricing") {
+            return std::make_shared<PricingSuite>(device);
+        }
+        // ...
+    }
+    
+    std::map<std::string, std::shared_ptr<SuiteExecutor>> executors_;
+};
+```
+
+4. Workflow Orchestrator - Minimal Change
+   ```cpp
+   //==============================================================================
+// Orchestrator Passes Device Preference to Registry
+//==============================================================================
+
+class WorkflowOrchestrator {
+public:
+    UniversalResult executeWorkflow(
+        const Portfolio& portfolio,
+        const std::vector<std::string>& requestedSuites,
+        const ExecutionPlan& plan,
+        const ExecutionConfig& executionConfig  // NEW parameter
+    ) {
+        UniversalResult result;
+        
+        for (const auto& suiteInfo : plan.executionOrder) {
+            // Determine device for this suite
+            ExecutionDevice device = determineDevice(
+                suiteInfo.name,
+                executionConfig
+            );
+            
+            // Get executor with device preference (ONLY CHANGE)
+            auto suite = registry_->getSuiteExecutor(
+                suiteInfo.name,
+                suiteInfo.version,
+                device  // Pass device preference
+            );
+            
+            // Everything else unchanged
+            ExecutionContext context = prepareContext(suiteInfo, result);
+            auto suiteResult = suite->execute(context);
+            
+            // Store result (same as before)
+            storeSuiteResult(suiteInfo.name, suiteResult, result);
+        }
+        
+        return result;
+    }
+    
+private:
+    ExecutionDevice determineDevice(
+        const std::string& suiteName,
+        const ExecutionConfig& config
+    ) {
+        // Check suite-specific override
+        auto it = config.suiteDeviceOverrides.find(suiteName);
+        if (it != config.suiteDeviceOverrides.end()) {
+            return it->second;
+        }
+        
+        // Use default preference
+        if (config.preferredDevice == ExecutionDevice::AUTO) {
+            return autoSelectDevice(suiteName);
+        }
+        
+        return config.preferredDevice;
+    }
+    
+    ExecutionDevice autoSelectDevice(const std::string& suiteName) {
+        // Check if GPU available
+        if (!GPUContext::isAvailable()) {
+            return ExecutionDevice::CPU;
+        }
+        
+        // Check suite capabilities
+        auto metadata = registry_->getMetadata(suiteName);
+        if (!metadata.capabilities.supportsGPU) {
+            return ExecutionDevice::CPU;
+        }
+        
+        // Use GPU if available and supported
+        return ExecutionDevice::GPU;
+    }
+};
+```
+Implementation Within Suite
+Example: Behavioral Suite with GPU Support
+//==============================================================================
+// Suite Internal Implementation - Where GPU Logic Lives
+//==============================================================================
+
+class BehavioralSuite : public SuiteExecutor {
+private:
+    SuiteResult executeOnCPU(const ExecutionContext& context) {
+        // Existing CPU implementation
+        auto prepayResult = prepaymentModelCPU_->calculate(
+            context.portfolio,
+            context.parameters
+        );
+        
+        auto defaultResult = defaultModelCPU_->calculate(
+            context.portfolio,
+            context.parameters
+        );
+        
+        return BehavioralSuiteResult(prepayResult, defaultResult);
+    }
+    
+    SuiteResult executeOnGPU(const ExecutionContext& context) {
+        // 1. Transfer portfolio data to GPU
+        auto portfolioGPU = gpuContext_->transferToGPU(context.portfolio);
+        auto paramsGPU = gpuContext_->transferToGPU(context.parameters);
+        
+        // 2. Execute models on GPU (parallel if possible)
+        auto prepayResultGPU = prepaymentModelGPU_->calculate(
+            portfolioGPU,
+            paramsGPU
+        );
+        
+        auto defaultResultGPU = defaultModelGPU_->calculate(
+            portfolioGPU,
+            paramsGPU
+        );
+        
+        // 3. Transfer results back to CPU
+        auto prepayResult = gpuContext_->transferFromGPU(prepayResultGPU);
+        auto defaultResult = gpuContext_->transferFromGPU(defaultResultGPU);
+        
+        // 4. Return same result format (CPU or GPU, result structure identical)
+        return BehavioralSuiteResult(prepayResult, defaultResult);
+    }
+    
+    // GPU resource management
+    std::unique_ptr<GPUContext> gpuContext_;
+};
+
+//==============================================================================
+// GPU Context - Manages GPU Resources
+//==============================================================================
+
+class GPUContext {
+public:
+    static bool isAvailable();
+    static size_t getAvailableMemoryMB();
+    
+    GPUContext(int deviceId = 0);
+    ~GPUContext();  // Cleanup GPU resources
+    
+    // Data transfer
+    template<typename T>
+    GPUBuffer<T> transferToGPU(const std::vector<T>& data);
+    
+    template<typename T>
+    std::vector<T> transferFromGPU(const GPUBuffer<T>& buffer);
+    
+private:
+    int deviceId_;
+    void* cudaStream_;  // Or equivalent for other GPU platforms
+};
+```
+
+---
+
+## Minimal Changes Summary
+```
+Layer                        Change Required?    Change Type
+═══════════════════════════════════════════════════════════════
+Presentation Layer           NO                  -
+Application Layer            NO                  -
+RequestBuilder               NO                  -
+WorkflowOrchestrator        MINOR               Pass device config
+SuiteRegistry               MINOR               Device-aware instantiation
+SuiteExecutor Interface     NO                  -
+UniversalResult             NO                  -
+ExecutionContext            NO                  -
+Data Access Layer           NO                  -
+Cache Layer                 NO                  -
+
+Individual Model Suites     YES (per suite)     Add GPU implementation
+└─ BehavioralSuite          YES                 executeOnGPU()
+└─ PricingSuite             YES (if needed)     executeOnGPU()
+└─ CashFlowSuite            YES (if needed)     executeOnGPU()

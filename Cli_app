@@ -1,0 +1,160 @@
+#include <iostream>
+#include <string>
+#include <chrono>
+#include <thread>
+#include <atomic>
+#include <sstream>
+#include <algorithm>
+#include <ctime>
+
+class CLIApplication {
+private:
+std::chrono::steady_clock::time_point lastActivityTime;
+std::atomic<bool> shouldRun{true};
+const int idleTimeoutMinutes;
+
+```
+void updateActivity() {
+    lastActivityTime = std::chrono::steady_clock::now();
+}
+
+bool isIdle() const {
+    auto now = std::chrono::steady_clock::now();
+    auto idleDuration = std::chrono::duration_cast<std::chrono::minutes>(
+        now - lastActivityTime
+    );
+    return idleDuration.count() >= idleTimeoutMinutes;
+}
+
+void processCommand(const std::string& command) {
+    if (command.empty()) {
+        return;
+    }
+
+    // Convert command to lowercase for case-insensitive comparison
+    std::string cmd = command;
+    std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::tolower);
+
+    if (cmd == "exit" || cmd == "quit") {
+        std::cout << "Exiting application...\n";
+        shouldRun = false;
+    }
+    else if (cmd == "help") {
+        showHelp();
+    }
+    else if (cmd == "status") {
+        showStatus();
+    }
+    else if (cmd == "time") {
+        auto now = std::chrono::system_clock::now();
+        std::time_t time = std::chrono::system_clock::to_time_t(now);
+        std::cout << "Current time: " << std::ctime(&time);
+    }
+    else {
+        std::cout << "Unknown command: " << command << "\n";
+        std::cout << "Type 'help' for available commands.\n";
+    }
+}
+
+void showHelp() {
+    std::cout << "\nAvailable commands:\n";
+    std::cout << "  help   - Show this help message\n";
+    std::cout << "  status - Show application status\n";
+    std::cout << "  time   - Show current time\n";
+    std::cout << "  exit   - Exit the application\n";
+    std::cout << "  quit   - Exit the application\n\n";
+}
+
+void showStatus() {
+    auto now = std::chrono::steady_clock::now();
+    auto idleDuration = std::chrono::duration_cast<std::chrono::seconds>(
+        now - lastActivityTime
+    );
+    int idleSeconds = idleDuration.count();
+    int remainingSeconds = (idleTimeoutMinutes * 60) - idleSeconds;
+
+    std::cout << "\nApplication Status:\n";
+    std::cout << "  Idle timeout: " << idleTimeoutMinutes << " minutes\n";
+    std::cout << "  Idle for: " << (idleSeconds / 60) << " minutes " 
+              << (idleSeconds % 60) << " seconds\n";
+    std::cout << "  Time until shutdown: " << (remainingSeconds / 60) 
+              << " minutes " << (remainingSeconds % 60) << " seconds\n\n";
+}
+```
+
+public:
+CLIApplication(int timeoutMinutes = 30)
+: idleTimeoutMinutes(timeoutMinutes) {
+updateActivity();
+}
+
+```
+void run() {
+    std::cout << "CLI Application Started\n";
+    std::cout << "Will shutdown after " << idleTimeoutMinutes 
+              << " minutes of inactivity.\n";
+    std::cout << "Type 'help' for available commands.\n\n";
+
+    // Start idle checker thread
+    std::thread idleChecker([this]() {
+        while (shouldRun) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (isIdle()) {
+                std::cout << "\n\nIdle timeout reached (" << idleTimeoutMinutes 
+                          << " minutes). Shutting down...\n";
+                shouldRun = false;
+            }
+        }
+    });
+
+    // Main command loop
+    std::string input;
+    while (shouldRun) {
+        std::cout << "> ";
+        std::cout.flush();
+
+        if (!std::getline(std::cin, input)) {
+            // EOF or input error
+            break;
+        }
+
+        updateActivity();
+        processCommand(input);
+    }
+
+    // Wait for idle checker thread to finish
+    if (idleChecker.joinable()) {
+        idleChecker.join();
+    }
+
+    std::cout << "Application terminated.\n";
+}
+```
+
+};
+
+int main(int argc, char* argv[]) {
+int timeoutMinutes = 30;
+
+```
+// Allow custom timeout via command line argument
+if (argc > 1) {
+    try {
+        timeoutMinutes = std::stoi(argv[1]);
+        if (timeoutMinutes <= 0) {
+            std::cerr << "Timeout must be positive. Using default: 30 minutes\n";
+            timeoutMinutes = 30;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Invalid timeout value. Using default: 30 minutes\n";
+        timeoutMinutes = 30;
+    }
+}
+
+CLIApplication app(timeoutMinutes);
+app.run();
+
+return 0;
+```
+
+}
